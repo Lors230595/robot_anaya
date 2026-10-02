@@ -8,6 +8,7 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "esp_adc/adc_oneshot.h"
+//no srvio
 
 // --- DEFINICIÓN DE PINES ADC ---
 #define POT1_ADC_CHANNEL ADC_CHANNEL_6 // GPIO34
