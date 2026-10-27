@@ -1,22 +1,15 @@
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 #include "driver/gpio.h"
+#include "driver/uart.h"
+#include "driver/gptimer.h"
 #include "esp_log.h"
-#include "esp_rom_sys.h"
-#include "esp_adc/adc_oneshot.h"
-//no srvio
-
-// --- DEFINICIÓN DE PINES ADC ---
-#define POT1_ADC_CHANNEL ADC_CHANNEL_6 // GPIO34
-#define POT2_ADC_CHANNEL ADC_CHANNEL_7 // GPIO35
-#define POT_MAX_ANGLE    270.0f
-
-// --- CONFIGURACIÓN DEL FILTRO DE RUIDO ---
-#define ALPHA_FILTRO     0.15f 
+#include "esp_attr.h"
 
 // --- DEFINICIÓN DE PINES MOTORES ---
 #define TB6600_1_STEP   GPIO_NUM_26
@@ -28,183 +21,277 @@
 #define TB6600_2_ENABLE GPIO_NUM_13
 
 // --- PARÁMETROS DEL MECANISMO ---
-#define PASOS_POR_VUELTA       400.0f
-#define GRADOS_POR_PASO        (360.0f / PASOS_POR_VUELTA)
-
-#define OBJETIVO_MOTOR1_GRADOS 30.0f
-#define OBJETIVO_MOTOR2_GRADOS 120.0f
-#define MARGEN_TOLERANCIA_DEG  1.5f
-
-#define ANCHO_PULSO_US         10
+#define PASOS_POR_VUELTA       400.0
+#define GRADOS_POR_PASO        (360.0 / PASOS_POR_VUELTA)    // 0.9 grados por paso
+#define MAX_GRADOS_ENTRADA     3600.0                        // límite de seguridad por comando
 
 // --- PARÁMETROS DE LA RAMPA EXPONENCIAL ---
-#define RETARDO_MIN_US         400    // Tiempo a velocidad máxima (us)
-#define RETARDO_MAX_US         2500   // Tiempo de arranque/parada suave (us)
-#define PASOS_RAMPA            30     // Pasos dedicados a acelerar/desacelerar
-#define PASOS_POR_RAFAGA       10     // Pasos por ciclo de FreeRTOS
+#define RETARDO_MIN_US         400    // Periodo a velocidad máxima (us)
+#define RETARDO_MAX_US         2500   // Periodo de arranque/parada suave (us)
+#define PASOS_ACEL             100     // Pasos dedicados a ACELERAR al inicio
+#define PASOS_DESACEL          100     // Pasos dedicados a DESACELERAR al final
 
-// --- ESTRUCTURA DE ESTADO COMPARTIDO ---
+// Perfil de la rampa:
+//   RAMPA_EXPONENCIAL : la curva que ya usabas (la más suave al arrancar)
+//   RAMPA_LINEAL      : aceleración constante (velocidad sube en línea recta)
+//   RAMPA_S_CURVA     : arranque y llegada muy suaves (curva de coseno)
+#define RAMPA_EXPONENCIAL      0
+#define RAMPA_LINEAL           1
+#define RAMPA_S_CURVA          2
+#define PERFIL_RAMPA           RAMPA_EXPONENCIAL
+
+// --- TEMPORIZADOR DE GENERACIÓN DE PASOS ---
+#define TICK_US                20     // Resolución del timer (us). El pulso STEP dura 1 tick (20 us)
+#define PAUSA_ENTRE_MOV_MS     50     // Reposo tras cada movimiento (deja asentar el rotor)
+
+#define NUM_MOTORES            2
+
 typedef struct {
-    float angulo_m1;
-    float angulo_m2;
-    float objetivo_m1;
-    float objetivo_m2;
-    SemaphoreHandle_t mutex;
-} estado_adc_t;
-
-static estado_adc_t g_estado_adc;
-
-typedef struct {
-    adc_channel_t adc_channel;
     gpio_num_t pin_step;
     gpio_num_t pin_dir;
-    float objetivo_grados;
+    gpio_num_t pin_enable;
     const char *nombre;
-    uint8_t motor_id;
-} config_motor_t;
 
-// Función de paso con retardo dinámico para controlar la velocidad
-static void dar_paso_dinamico(gpio_num_t pin_step, gpio_num_t pin_dir, bool sentido, uint32_t retardo_us)
+    // Compartido con la ISR
+    volatile bool     activo;
+    volatile bool     pulso_alto;
+    volatile uint32_t pasos_total;
+    volatile uint32_t pasos_hechos;
+    volatile int32_t  espera_ticks;
+    volatile uint32_t periodo_ticks;
+
+    // Solo tarea principal
+    int32_t pos_pasos;        // posición real acumulada (pasos con signo desde el arranque)
+    double  ideal_grados;     // posición ideal acumulada (suma exacta de lo que pediste)
+    int32_t pasos_orden;      // pasos con signo del movimiento actual
+    int32_t pos_inicio;       // pos_pasos al inicio del movimiento actual
+} motor_t;
+
+static motor_t g_motores[NUM_MOTORES] = {
+    { .pin_step = TB6600_1_STEP, .pin_dir = TB6600_1_DIR, .pin_enable = TB6600_1_ENABLE, .nombre = "M1" },
+    { .pin_step = TB6600_2_STEP, .pin_dir = TB6600_2_DIR, .pin_enable = TB6600_2_ENABLE, .nombre = "M2" },
+};
+
+static uint32_t g_tabla_acel[PASOS_ACEL + 1];       // periodo (ticks) según pasos ya dados
+static uint32_t g_tabla_desacel[PASOS_DESACEL + 1]; // periodo (ticks) según pasos que faltan
+static gptimer_handle_t g_timer = NULL;
+
+// Periodo entre pasos (en ticks) para un avance de rampa f = 0..1
+// f = 0 -> arranque (RETARDO_MAX_US, lento) | f = 1 -> velocidad máxima (RETARDO_MIN_US)
+static uint32_t calcular_periodo_ticks(float f)
 {
-    gpio_set_level(pin_dir, sentido);
-    gpio_set_level(pin_step, 1);
-    esp_rom_delay_us(ANCHO_PULSO_US);
-    gpio_set_level(pin_step, 0);
-    
-    if (retardo_us > ANCHO_PULSO_US) {
-        esp_rom_delay_us(retardo_us - ANCHO_PULSO_US);
+    float retardo_us;
+
+#if PERFIL_RAMPA == RAMPA_EXPONENCIAL
+    retardo_us = RETARDO_MIN_US + (RETARDO_MAX_US - RETARDO_MIN_US) * expf(-3.0f * f);
+#else
+    // Se interpola la VELOCIDAD (pasos/s) y luego se convierte a periodo
+    float v0 = 1000000.0f / RETARDO_MAX_US;
+    float v1 = 1000000.0f / RETARDO_MIN_US;
+    float s = f;
+#if PERFIL_RAMPA == RAMPA_S_CURVA
+    s = 0.5f * (1.0f - cosf(3.14159265f * f));
+#endif
+    retardo_us = 1000000.0f / (v0 + (v1 - v0) * s);
+#endif
+
+    return (uint32_t)(retardo_us / TICK_US + 0.5f);
+}
+
+static void construir_tabla(uint32_t *tabla, int pasos)
+{
+    for (int i = 0; i <= pasos; i++) {
+        float f = (pasos > 0) ? (float)i / (float)pasos : 1.0f;
+        tabla[i] = calcular_periodo_ticks(f);
     }
 }
 
-// --- TAREA LECTURA ADC CON FILTRO ---
-static void tarea_lectura_adc(void *arg)
+// Tablas de aceleración y desaceleración (la ISR no puede usar float, por eso se precalculan)
+static void construir_tablas_rampa(void)
 {
-    adc_oneshot_unit_handle_t adc_handle = (adc_oneshot_unit_handle_t)arg;
-    int raw_val1 = 0, raw_val2 = 0;
-
-    static float angulo_filtrado_m1 = -1.0f;
-    static float angulo_filtrado_m2 = -1.0f;
-
-    while (1) {
-        if (adc_oneshot_read(adc_handle, POT1_ADC_CHANNEL, &raw_val1) == ESP_OK &&
-            adc_oneshot_read(adc_handle, POT2_ADC_CHANNEL, &raw_val2) == ESP_OK) {
-            
-            float a1_raw = ((float)raw_val1 / 4095.0f) * POT_MAX_ANGLE;
-            float a2_raw = ((float)raw_val2 / 4095.0f) * POT_MAX_ANGLE;
-
-            if (angulo_filtrado_m1 < 0.0f) {
-                angulo_filtrado_m1 = a1_raw;
-                angulo_filtrado_m2 = a2_raw;
-            } else {
-                angulo_filtrado_m1 = (ALPHA_FILTRO * a1_raw) + ((1.0f - ALPHA_FILTRO) * angulo_filtrado_m1);
-                angulo_filtrado_m2 = (ALPHA_FILTRO * a2_raw) + ((1.0f - ALPHA_FILTRO) * angulo_filtrado_m2);
-            }
-
-            if (xSemaphoreTake(g_estado_adc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                g_estado_adc.angulo_m1 = angulo_filtrado_m1;
-                g_estado_adc.angulo_m2 = angulo_filtrado_m2;
-                xSemaphoreGive(g_estado_adc.mutex);
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
+    construir_tabla(g_tabla_acel, PASOS_ACEL);
+    construir_tabla(g_tabla_desacel, PASOS_DESACEL);
 }
 
-// --- TAREA CONTROL DE MOTOR ---
-static void tarea_control_motor(void *arg)
+// --- ISR: genera los pulsos STEP de ambos motores con temporización constante ---
+static bool IRAM_ATTR timer_isr_cb(gptimer_handle_t timer,
+                                   const gptimer_alarm_event_data_t *edata,
+                                   void *user_ctx)
 {
-    const config_motor_t *cfg = (const config_motor_t *)arg;
-    int contador_log = 0;
-    int pasos_recorridos = 0;
-    float velocidad_pasos_sec = 0.0f;
+    for (int i = 0; i < NUM_MOTORES; i++) {
+        motor_t *m = &g_motores[i];
+        if (!m->activo) continue;
 
-    while (1) {
-        float angulo_actual = 0.0f;
-        float objetivo_grados = cfg->objetivo_grados;
+        if (m->pulso_alto) {
+            gpio_set_level(m->pin_step, 0);
+            m->pulso_alto = false;
 
-        if (xSemaphoreTake(g_estado_adc.mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-            angulo_actual = (cfg->motor_id == 1) ? g_estado_adc.angulo_m1 : g_estado_adc.angulo_m2;
-            objetivo_grados = (cfg->motor_id == 1) ? g_estado_adc.objetivo_m1 : g_estado_adc.objetivo_m2;
-            xSemaphoreGive(g_estado_adc.mutex);
-        }
+            uint32_t hechos = m->pasos_hechos + 1;
+            m->pasos_hechos = hechos;
 
-        float error = objetivo_grados - angulo_actual;
-        bool en_tolerancia = fabsf(error) <= MARGEN_TOLERANCIA_DEG;
-        int pasos_faltantes = (int)(fabsf(error) / GRADOS_POR_PASO);
-
-        if (!en_tolerancia) {
-            bool direccion = (error > 0.0f) ? 1 : 0;
-            int pasos_a_dar = (pasos_faltantes < PASOS_POR_RAFAGA) ? pasos_faltantes : PASOS_POR_RAFAGA;
-
-            for (int i = 0; i < pasos_a_dar; i++) {
-                // Cálculo de factores de rampa exponencial
-                float factor_acel = (float)pasos_recorridos / (float)PASOS_RAMPA;
-                float factor_desacel = (float)pasos_faltantes / (float)PASOS_RAMPA;
-
-                if (factor_acel > 1.0f) factor_acel = 1.0f;
-                if (factor_desacel > 1.0f) factor_desacel = 1.0f;
-
-                float factor_velocidad = (factor_acel < factor_desacel) ? factor_acel : factor_desacel;
-                float exp_decay = expf(-3.0f * factor_velocidad); 
-                uint32_t retardo_actual_us = (uint32_t)(RETARDO_MIN_US + (RETARDO_MAX_US - RETARDO_MIN_US) * exp_decay);
-
-                // Calcular velocidad actual para la gráfica
-                velocidad_pasos_sec = 1000000.0f / (float)retardo_actual_us;
-
-                dar_paso_dinamico(cfg->pin_step, cfg->pin_dir, direccion, retardo_actual_us);
-
-                pasos_recorridos++;
-                pasos_faltantes--;
+            if (hechos >= m->pasos_total) {
+                m->activo = false;
+                continue;
             }
 
-            vTaskDelay(1); // Ceder tiempo sin bloquear
-        } else {
-            pasos_recorridos = 0;
-            velocidad_pasos_sec = 0.0f;
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
+            // Rampa: acelera según los pasos dados y desacelera según los que faltan;
+            // se usa el periodo más lento de los dos (si el recorrido es corto, queda triangular)
+            uint32_t faltan = m->pasos_total - hechos;
+            uint32_t idx_a = (hechos < PASOS_ACEL) ? hechos : PASOS_ACEL;
+            uint32_t idx_d = (faltan < PASOS_DESACEL) ? faltan : PASOS_DESACEL;
+            uint32_t per_a = g_tabla_acel[idx_a];
+            uint32_t per_d = g_tabla_desacel[idx_d];
 
-        // SALIDA ÚNICA A TELEPLOT (Se imprime periódicamente fuera del loop rápido)
-        if (++contador_log >= 5) {
-            printf(">%s_Pos_Actual:%.1f\n", cfg->nombre, angulo_actual);
-            printf(">%s_Pasos_Restantes:%d\n", cfg->nombre, en_tolerancia ? 0 : pasos_faltantes);
-            printf(">%s_Objetivo:%.1f\n", cfg->nombre, objetivo_grados);
-            printf(">%s_Velocidad:%.1f\n", cfg->nombre, velocidad_pasos_sec);
-            fflush(stdout);
-            contador_log = 0;
+            m->periodo_ticks = (per_a > per_d) ? per_a : per_d;
+            m->espera_ticks = (int32_t)m->periodo_ticks - 1;
+        } else if (--m->espera_ticks <= 0) {
+            gpio_set_level(m->pin_step, 1);
+            m->pulso_alto = true;
         }
     }
+    return false;
 }
 
-// Lee los nuevos setpoints desde la consola en el formato: M1,M2 y Enter.
-static void tarea_entrada_setpoints(void *arg)
+// --- ENTRADA POR CONSOLA (lectura bloqueante con eco) ---
+static void leer_linea(char *buf, size_t max)
 {
-    (void)arg;
-    char linea[64];
+    size_t len = 0;
+    uint8_t c;
 
     while (1) {
-        printf("Ingrese setpoints en grados (M1,M2): ");
+        if (uart_read_bytes(UART_NUM_0, &c, 1, portMAX_DELAY) != 1) continue;
+
+        if (c == '\r' || c == '\n') {
+            if (len == 0) continue;
+            uart_write_bytes(UART_NUM_0, "\r\n", 2);
+            break;
+        } else if (c == 0x08 || c == 0x7F) {
+            if (len > 0) {
+                len--;
+                uart_write_bytes(UART_NUM_0, "\b \b", 3);
+            }
+        } else if (len < max - 1 && c >= 32 && c < 127) {
+            buf[len++] = (char)c;
+            uart_write_bytes(UART_NUM_0, (const char *)&c, 1);
+        }
+    }
+    buf[len] = '\0';
+}
+
+// Interpreta "M1,M2" (ej: 100,150). Decimales con punto: 45.5,90
+static bool parsear_comando(const char *texto, double *v1, double *v2)
+{
+    char *fin = NULL;
+    const char *p = texto;
+
+    *v1 = strtod(p, &fin);
+    if (fin == p) return false;
+    p = fin;
+
+    while (*p == ' ') p++;
+    if (*p != ',') return false;
+    p++;
+
+    *v2 = strtod(p, &fin);
+    if (fin == p) return false;
+    p = fin;
+
+    while (*p == ' ') p++;
+    if (*p != '\0') return false;
+
+    return isfinite(*v1) && isfinite(*v2);
+}
+
+static void pedir_comando(double *g1, double *g2)
+{
+    char buf[48];
+
+    while (1) {
+        printf("Comando M1,M2 (grados a mover, ej: 100,150): ");
         fflush(stdout);
+        leer_linea(buf, sizeof(buf));
 
-        if (fgets(linea, sizeof(linea), stdin) == NULL) {
-            vTaskDelay(pdMS_TO_TICKS(100));
+        if (!parsear_comando(buf, g1, g2)) {
+            printf("  Comando invalido. Use: numero,numero (ej: 100,150)\n");
             continue;
         }
+        if (fabs(*g1) > MAX_GRADOS_ENTRADA || fabs(*g2) > MAX_GRADOS_ENTRADA) {
+            printf("  Maximo permitido: %.0f grados por motor.\n", MAX_GRADOS_ENTRADA);
+            continue;
+        }
+        return;
+    }
+}
 
-        float objetivo_m1, objetivo_m2;
-        char extra;
-        if (sscanf(linea, " %f , %f %c", &objetivo_m1, &objetivo_m2, &extra) == 2 &&
-            isfinite(objetivo_m1) && isfinite(objetivo_m2)) {
-            if (xSemaphoreTake(g_estado_adc.mutex, portMAX_DELAY) == pdTRUE) {
-                g_estado_adc.objetivo_m1 = objetivo_m1;
-                g_estado_adc.objetivo_m2 = objetivo_m2;
-                xSemaphoreGive(g_estado_adc.mutex);
-            }
-            printf("Nuevos setpoints: M1=%.2f, M2=%.2f\n", objetivo_m1, objetivo_m2);
-        } else {
-            printf("Entrada no valida. Use: numero,numero\n");
+// --- SALIDA A TELEPLOT ---
+static void imprimir_teleplot(void)
+{
+    for (int i = 0; i < NUM_MOTORES; i++) {
+        motor_t *m = &g_motores[i];
+        uint32_t hechos = m->pasos_hechos;
+        uint32_t total = m->pasos_total;
+        bool activo = m->activo;
+
+        int32_t pos = m->pos_inicio + ((m->pasos_orden >= 0) ? (int32_t)hechos : -(int32_t)hechos);
+        float velocidad = activo ? 1000000.0f / ((float)m->periodo_ticks * TICK_US) : 0.0f;
+        double objetivo = (m->pos_inicio + m->pasos_orden) * GRADOS_POR_PASO;
+
+        printf(">%s_Pos_Actual:%.2f\n", m->nombre, pos * GRADOS_POR_PASO);
+        printf(">%s_Pasos_Restantes:%lu\n", m->nombre, (unsigned long)(total - hechos));
+        printf(">%s_Objetivo:%.2f\n", m->nombre, objetivo);
+        printf(">%s_Velocidad:%.1f\n", m->nombre, velocidad);
+    }
+    fflush(stdout);
+}
+
+static bool hay_motor_activo(void)
+{
+    for (int i = 0; i < NUM_MOTORES; i++) {
+        if (g_motores[i].activo) return true;
+    }
+    return false;
+}
+
+// --- EJECUTA UN MOVIMIENTO SIMULTÁNEO ---
+static void mover_motores(void)
+{
+    for (int i = 0; i < NUM_MOTORES; i++) {
+        motor_t *m = &g_motores[i];
+        uint32_t pasos = (uint32_t)abs((int)m->pasos_orden);
+
+        m->pos_inicio = m->pos_pasos;
+        m->pasos_hechos = 0;
+        m->pasos_total = pasos;
+        m->pulso_alto = false;
+        m->periodo_ticks = g_tabla_acel[0];
+        m->espera_ticks = (int32_t)g_tabla_acel[0];
+
+        if (pasos > 0) {
+            gpio_set_level(m->pin_dir, m->pasos_orden > 0 ? 1 : 0);
         }
     }
+
+    vTaskDelay(pdMS_TO_TICKS(10));   // tiempo de establecimiento de DIR
+
+    // Ambos se activan justo antes de arrancar el timer => salen sincronizados
+    for (int i = 0; i < NUM_MOTORES; i++) {
+        g_motores[i].activo = (g_motores[i].pasos_total > 0);
+    }
+    gptimer_set_raw_count(g_timer, 0);
+    ESP_ERROR_CHECK(gptimer_start(g_timer));
+
+    while (hay_motor_activo()) {
+        imprimir_teleplot();
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
+    ESP_ERROR_CHECK(gptimer_stop(g_timer));
+    for (int i = 0; i < NUM_MOTORES; i++) {
+        gpio_set_level(g_motores[i].pin_step, 0);
+        g_motores[i].pos_pasos = g_motores[i].pos_inicio + g_motores[i].pasos_orden;
+    }
+    imprimir_teleplot();
+    vTaskDelay(pdMS_TO_TICKS(PAUSA_ENTRE_MOV_MS));
 }
 
 void app_main(void)
@@ -219,45 +306,67 @@ void app_main(void)
     };
     gpio_config(&config_motores);
 
+    gpio_set_level(TB6600_1_STEP, 0);
+    gpio_set_level(TB6600_2_STEP, 0);
     gpio_set_level(TB6600_1_ENABLE, 0);
     gpio_set_level(TB6600_2_ENABLE, 0);
 
-    adc_oneshot_unit_handle_t adc_handle;
-    const adc_oneshot_unit_init_cfg_t unit_config = { .unit_id = ADC_UNIT_1 };
-    const adc_oneshot_chan_cfg_t channel_config = {
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-        .atten = ADC_ATTEN_DB_12,
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
+
+    construir_tablas_rampa();
+
+    gptimer_config_t timer_cfg = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000,   // 1 tick = 1 us
     };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_cfg, &g_timer));
 
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_config, &adc_handle));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT1_ADC_CHANNEL, &channel_config));
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT2_ADC_CHANNEL, &channel_config));
-
-    g_estado_adc.mutex = xSemaphoreCreateMutex();
-    g_estado_adc.objetivo_m1 = OBJETIVO_MOTOR1_GRADOS;
-    g_estado_adc.objetivo_m2 = OBJETIVO_MOTOR2_GRADOS;
-
-    static const config_motor_t motor1_cfg = {
-        .adc_channel = POT1_ADC_CHANNEL,
-        .pin_step = TB6600_1_STEP,
-        .pin_dir = TB6600_1_DIR,
-        .objetivo_grados = OBJETIVO_MOTOR1_GRADOS,
-        .nombre = "M1",
-        .motor_id = 1
+    gptimer_alarm_config_t alarm_cfg = {
+        .alarm_count = TICK_US,
+        .reload_count = 0,
+        .flags.auto_reload_on_alarm = true,
     };
+    ESP_ERROR_CHECK(gptimer_set_alarm_action(g_timer, &alarm_cfg));
 
-    static const config_motor_t motor2_cfg = {
-        .adc_channel = POT2_ADC_CHANNEL,
-        .pin_step = TB6600_2_STEP,
-        .pin_dir = TB6600_2_DIR,
-        .objetivo_grados = OBJETIVO_MOTOR2_GRADOS,
-        .nombre = "M2",
-        .motor_id = 2
-    };
+    gptimer_event_callbacks_t cbs = { .on_alarm = timer_isr_cb };
+    ESP_ERROR_CHECK(gptimer_register_event_callbacks(g_timer, &cbs, NULL));
+    ESP_ERROR_CHECK(gptimer_enable(g_timer));
 
-    xTaskCreate(tarea_lectura_adc, "tarea_adc", 3072, (void *)adc_handle, 5, NULL);
-    xTaskCreate(tarea_control_motor, "control_m1", 3072, (void *)&motor1_cfg, 5, NULL);
-    xTaskCreate(tarea_control_motor, "control_m2", 3072, (void *)&motor2_cfg, 5, NULL);
-    xTaskCreate(tarea_entrada_setpoints, "entrada_setpoints", 3072, NULL, 5, NULL);
-    
+    vTaskDelay(pdMS_TO_TICKS(300));
+    printf("\n=== Control de 2 motores NEMA17 + TB6600 ===\n");
+    printf("Resolucion: %.2f grados/paso (%.0f pasos/vuelta)\n", GRADOS_POR_PASO, PASOS_POR_VUELTA);
+    printf("Formato: M1,M2  (negativo = sentido contrario, 0 = ese motor quieto)\n\n");
+
+    while (1) {
+        double d[NUM_MOTORES];
+        pedir_comando(&d[0], &d[1]);
+
+        bool alguno = false;
+
+        for (int i = 0; i < NUM_MOTORES; i++) {
+            motor_t *m = &g_motores[i];
+
+            // Compensación del redondeo: se acumula lo pedido y se calcula el paso objetivo
+            // absoluto, así el error nunca pasa de medio paso (0.45 grados) por mucho que muevas.
+            m->ideal_grados += d[i] * 1.8;
+            int32_t objetivo_pasos = (int32_t)llround(m->ideal_grados / GRADOS_POR_PASO);
+            m->pasos_orden = objetivo_pasos - m->pos_pasos;
+
+            if (m->pasos_orden != 0) alguno = true;
+
+            printf("%s: %ld pasos (%.2f grados) | pedido acumulado %.2f | posicion final %.2f | error %+.2f\n",
+                   m->nombre, (long)m->pasos_orden, m->pasos_orden * GRADOS_POR_PASO,
+                   m->ideal_grados, objetivo_pasos * GRADOS_POR_PASO,
+                   objetivo_pasos * GRADOS_POR_PASO - m->ideal_grados);
+        }
+
+        if (!alguno) {
+            printf("Nada que mover.\n\n");
+            continue;
+        }
+
+        mover_motores();
+        printf("Movimiento completado.\n\n");
+    }
 }
