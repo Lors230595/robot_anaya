@@ -349,7 +349,7 @@ void app_main(void)
 
             // Compensación del redondeo: se acumula lo pedido y se calcula el paso objetivo
             // absoluto, así el error nunca pasa de medio paso (0.45 grados) por mucho que muevas.
-            m->ideal_grados += (i == 1) ? d[i] : d[i] * 1.8;
+            m->ideal_grados += (i == 1) ? d[i] * 1.0825 : d[i] * 1.8;
             int32_t objetivo_pasos = (int32_t)llround(m->ideal_grados / GRADOS_POR_PASO);
             m->pasos_orden = objetivo_pasos - m->pos_pasos;
 
