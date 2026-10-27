@@ -51,6 +51,7 @@ typedef struct {
     gpio_num_t pin_dir;
     gpio_num_t pin_enable;
     const char *nombre;
+    gptimer_handle_t timer;
 
     // Compartido con la ISR
     volatile bool     activo;
@@ -74,7 +75,6 @@ static motor_t g_motores[NUM_MOTORES] = {
 
 static uint32_t g_tabla_acel[PASOS_ACEL + 1];       // periodo (ticks) según pasos ya dados
 static uint32_t g_tabla_desacel[PASOS_DESACEL + 1]; // periodo (ticks) según pasos que faltan
-static gptimer_handle_t g_timer = NULL;
 
 // Periodo entre pasos (en ticks) para un avance de rampa f = 0..1
 // f = 0 -> arranque (RETARDO_MAX_US, lento) | f = 1 -> velocidad máxima (RETARDO_MIN_US)
@@ -113,41 +113,38 @@ static void construir_tablas_rampa(void)
     construir_tabla(g_tabla_desacel, PASOS_DESACEL);
 }
 
-// --- ISR: genera los pulsos STEP de ambos motores con temporización constante ---
+// --- ISR: genera los pulsos STEP de un motor de forma independiente ---
 static bool IRAM_ATTR timer_isr_cb(gptimer_handle_t timer,
                                    const gptimer_alarm_event_data_t *edata,
                                    void *user_ctx)
 {
-    for (int i = 0; i < NUM_MOTORES; i++) {
-        motor_t *m = &g_motores[i];
-        if (!m->activo) continue;
+    motor_t *m = (motor_t *)user_ctx;
+    if (!m->activo) return false;
 
-        if (m->pulso_alto) {
-            gpio_set_level(m->pin_step, 0);
-            m->pulso_alto = false;
+    if (m->pulso_alto) {
+        gpio_set_level(m->pin_step, 0);
+        m->pulso_alto = false;
 
-            uint32_t hechos = m->pasos_hechos + 1;
-            m->pasos_hechos = hechos;
+        uint32_t hechos = m->pasos_hechos + 1;
+        m->pasos_hechos = hechos;
 
-            if (hechos >= m->pasos_total) {
-                m->activo = false;
-                continue;
-            }
-
-            // Rampa: acelera según los pasos dados y desacelera según los que faltan;
-            // se usa el periodo más lento de los dos (si el recorrido es corto, queda triangular)
-            uint32_t faltan = m->pasos_total - hechos;
-            uint32_t idx_a = (hechos < PASOS_ACEL) ? hechos : PASOS_ACEL;
-            uint32_t idx_d = (faltan < PASOS_DESACEL) ? faltan : PASOS_DESACEL;
-            uint32_t per_a = g_tabla_acel[idx_a];
-            uint32_t per_d = g_tabla_desacel[idx_d];
-
-            m->periodo_ticks = (per_a > per_d) ? per_a : per_d;
-            m->espera_ticks = (int32_t)m->periodo_ticks - 1;
-        } else if (--m->espera_ticks <= 0) {
-            gpio_set_level(m->pin_step, 1);
-            m->pulso_alto = true;
+        if (hechos >= m->pasos_total) {
+            m->activo = false;
+            return false;
         }
+
+        // Rampa propia de este motor: acelera según los pasos dados y desacelera según los que faltan.
+        uint32_t faltan = m->pasos_total - hechos;
+        uint32_t idx_a = (hechos < PASOS_ACEL) ? hechos : PASOS_ACEL;
+        uint32_t idx_d = (faltan < PASOS_DESACEL) ? faltan : PASOS_DESACEL;
+        uint32_t per_a = g_tabla_acel[idx_a];
+        uint32_t per_d = g_tabla_desacel[idx_d];
+
+        m->periodo_ticks = (per_a > per_d) ? per_a : per_d;
+        m->espera_ticks = (int32_t)m->periodo_ticks - 1;
+    } else if (--m->espera_ticks <= 0) {
+        gpio_set_level(m->pin_step, 1);
+        m->pulso_alto = true;
     }
     return false;
 }
@@ -273,20 +270,25 @@ static void mover_motores(void)
 
     vTaskDelay(pdMS_TO_TICKS(10));   // tiempo de establecimiento de DIR
 
-    // Ambos se activan justo antes de arrancar el timer => salen sincronizados
+    // Cada motor arranca y genera sus pasos con su propio temporizador.
     for (int i = 0; i < NUM_MOTORES; i++) {
-        g_motores[i].activo = (g_motores[i].pasos_total > 0);
+        motor_t *m = &g_motores[i];
+        m->activo = (m->pasos_total > 0);
+        if (m->activo) {
+            ESP_ERROR_CHECK(gptimer_set_raw_count(m->timer, 0));
+            ESP_ERROR_CHECK(gptimer_start(m->timer));
+        }
     }
-    gptimer_set_raw_count(g_timer, 0);
-    ESP_ERROR_CHECK(gptimer_start(g_timer));
 
     while (hay_motor_activo()) {
         imprimir_teleplot();
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 
-    ESP_ERROR_CHECK(gptimer_stop(g_timer));
     for (int i = 0; i < NUM_MOTORES; i++) {
+        if (g_motores[i].pasos_total > 0) {
+            ESP_ERROR_CHECK(gptimer_stop(g_motores[i].timer));
+        }
         gpio_set_level(g_motores[i].pin_step, 0);
         g_motores[i].pos_pasos = g_motores[i].pos_inicio + g_motores[i].pasos_orden;
     }
@@ -315,23 +317,26 @@ void app_main(void)
 
     construir_tablas_rampa();
 
-    gptimer_config_t timer_cfg = {
-        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
-        .direction = GPTIMER_COUNT_UP,
-        .resolution_hz = 1000000,   // 1 tick = 1 us
-    };
-    ESP_ERROR_CHECK(gptimer_new_timer(&timer_cfg, &g_timer));
+    for (int i = 0; i < NUM_MOTORES; i++) {
+        motor_t *m = &g_motores[i];
+        gptimer_config_t timer_cfg = {
+            .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+            .direction = GPTIMER_COUNT_UP,
+            .resolution_hz = 1000000,   // 1 tick = 1 us
+        };
+        ESP_ERROR_CHECK(gptimer_new_timer(&timer_cfg, &m->timer));
 
-    gptimer_alarm_config_t alarm_cfg = {
-        .alarm_count = TICK_US,
-        .reload_count = 0,
-        .flags.auto_reload_on_alarm = true,
-    };
-    ESP_ERROR_CHECK(gptimer_set_alarm_action(g_timer, &alarm_cfg));
+        gptimer_alarm_config_t alarm_cfg = {
+            .alarm_count = TICK_US,
+            .reload_count = 0,
+            .flags.auto_reload_on_alarm = true,
+        };
+        ESP_ERROR_CHECK(gptimer_set_alarm_action(m->timer, &alarm_cfg));
 
-    gptimer_event_callbacks_t cbs = { .on_alarm = timer_isr_cb };
-    ESP_ERROR_CHECK(gptimer_register_event_callbacks(g_timer, &cbs, NULL));
-    ESP_ERROR_CHECK(gptimer_enable(g_timer));
+        gptimer_event_callbacks_t cbs = { .on_alarm = timer_isr_cb };
+        ESP_ERROR_CHECK(gptimer_register_event_callbacks(m->timer, &cbs, m));
+        ESP_ERROR_CHECK(gptimer_enable(m->timer));
+    }
 
     vTaskDelay(pdMS_TO_TICKS(300));
     printf("\n=== Control de 2 motores NEMA17 + TB6600 ===\n");
