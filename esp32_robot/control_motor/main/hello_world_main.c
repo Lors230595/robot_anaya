@@ -8,6 +8,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "driver/gptimer.h"
+#include "driver/ledc.h"
 #include "esp_log.h"
 #include "esp_attr.h"
 
@@ -20,6 +21,13 @@
 #define TB6600_2_DIR    GPIO_NUM_12
 #define TB6600_2_ENABLE GPIO_NUM_13
 
+// Servo azul (p. ej., SG90): señal PWM en GPIO18.
+// Alimenta el servo desde una fuente externa de 5 V y une las tierras (GND).
+#define SERVO_GPIO       GPIO_NUM_18
+#define SERVO_MIN_US     500
+#define SERVO_MAX_US     2500
+#define SERVO_PERIOD_US  20000
+
 // --- PARÁMETROS DEL MECANISMO ---
 #define PASOS_POR_VUELTA       400.0
 #define GRADOS_POR_PASO        (360.0 / PASOS_POR_VUELTA)    // 0.9 grados por paso
@@ -30,6 +38,7 @@
 #define RETARDO_MAX_US         2500   // Periodo de arranque/parada suave (us)
 #define PASOS_ACEL             100     // Pasos dedicados a ACELERAR al inicio
 #define PASOS_DESACEL          100     // Pasos dedicados a DESACELERAR al final
+#define VELOCIDAD_FACTOR       0.60f   // 60% de la velocidad actual
 
 // Perfil de la rampa:
 //   RAMPA_EXPONENCIAL : la curva que ya usabas (la más suave al arrancar)
@@ -73,6 +82,20 @@ static motor_t g_motores[NUM_MOTORES] = {
     { .pin_step = TB6600_2_STEP, .pin_dir = TB6600_2_DIR, .pin_enable = TB6600_2_ENABLE, .nombre = "M2" },
 };
 
+static float g_servo_grados = 90.0f;
+
+static void servo_fijar_grados(float grados)
+{
+    if (grados < 0.0f) grados = 0.0f;
+    if (grados > 180.0f) grados = 180.0f;
+
+    float pulso_us = SERVO_MIN_US + (SERVO_MAX_US - SERVO_MIN_US) * grados / 180.0f;
+    uint32_t duty = (uint32_t)(pulso_us * 65535.0f / SERVO_PERIOD_US + 0.5f);
+    ESP_ERROR_CHECK(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty));
+    ESP_ERROR_CHECK(ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0));
+    g_servo_grados = grados;
+}
+
 static uint32_t g_tabla_acel[PASOS_ACEL + 1];       // periodo (ticks) según pasos ya dados
 static uint32_t g_tabla_desacel[PASOS_DESACEL + 1]; // periodo (ticks) según pasos que faltan
 
@@ -94,6 +117,9 @@ static uint32_t calcular_periodo_ticks(float f)
 #endif
     retardo_us = 1000000.0f / (v0 + (v1 - v0) * s);
 #endif
+
+    // Reduce la velocidad general a un 80% de la velocidad actual.
+    retardo_us /= VELOCIDAD_FACTOR;
 
     return (uint32_t)(retardo_us / TICK_US + 0.5f);
 }
@@ -175,8 +201,8 @@ static void leer_linea(char *buf, size_t max)
     buf[len] = '\0';
 }
 
-// Interpreta "M1,M2" (ej: 100,150). Decimales con punto: 45.5,90
-static bool parsear_comando(const char *texto, double *v1, double *v2)
+// Interpreta "M1,M2,servo"; el tercer valor son grados incrementales.
+static bool parsear_comando(const char *texto, double *v1, double *v2, double *v3)
 {
     char *fin = NULL;
     const char *p = texto;
@@ -194,25 +220,34 @@ static bool parsear_comando(const char *texto, double *v1, double *v2)
     p = fin;
 
     while (*p == ' ') p++;
+    if (*p != ',') return false;
+    p++;
+
+    *v3 = strtod(p, &fin);
+    if (fin == p) return false;
+    p = fin;
+
+    while (*p == ' ') p++;
     if (*p != '\0') return false;
 
-    return isfinite(*v1) && isfinite(*v2);
+    return isfinite(*v1) && isfinite(*v2) && isfinite(*v3);
 }
 
-static void pedir_comando(double *g1, double *g2)
+static void pedir_comando(double *g1, double *g2, double *g3)
 {
     char buf[48];
 
     while (1) {
-        printf("Comando M1,M2 (grados a mover, ej: 100,150): ");
+        printf("Comando M1,M2,Servo (grados incrementales, ej: 100,150,30): ");
         fflush(stdout);
         leer_linea(buf, sizeof(buf));
 
-        if (!parsear_comando(buf, g1, g2)) {
-            printf("  Comando invalido. Use: numero,numero (ej: 100,150)\n");
+        if (!parsear_comando(buf, g1, g2, g3)) {
+            printf("  Comando invalido. Use: numero,numero,numero (ej: 100,150,30)\n");
             continue;
         }
-        if (fabs(*g1) > MAX_GRADOS_ENTRADA || fabs(*g2) > MAX_GRADOS_ENTRADA) {
+        if (fabs(*g1) > MAX_GRADOS_ENTRADA || fabs(*g2) > MAX_GRADOS_ENTRADA ||
+            fabs(*g3) > MAX_GRADOS_ENTRADA) {
             printf("  Maximo permitido: %.0f grados por motor.\n", MAX_GRADOS_ENTRADA);
             continue;
         }
@@ -313,6 +348,26 @@ void app_main(void)
     gpio_set_level(TB6600_1_ENABLE, 0);
     gpio_set_level(TB6600_2_ENABLE, 0);
 
+    ledc_timer_config_t servo_timer_cfg = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .duty_resolution = LEDC_TIMER_16_BIT,
+        .timer_num = LEDC_TIMER_0,
+        .freq_hz = 50,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ESP_ERROR_CHECK(ledc_timer_config(&servo_timer_cfg));
+    ledc_channel_config_t servo_channel_cfg = {
+        .gpio_num = SERVO_GPIO,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_0,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_0,
+        .duty = 0,
+        .hpoint = 0,
+    };
+    ESP_ERROR_CHECK(ledc_channel_config(&servo_channel_cfg));
+    servo_fijar_grados(g_servo_grados);
+
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
 
     construir_tablas_rampa();
@@ -341,11 +396,11 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(300));
     printf("\n=== Control de 2 motores NEMA17 + TB6600 ===\n");
     printf("Resolucion: %.2f grados/paso (%.0f pasos/vuelta)\n", GRADOS_POR_PASO, PASOS_POR_VUELTA);
-    printf("Formato: M1,M2  (negativo = sentido contrario, 0 = ese motor quieto)\n\n");
+    printf("Formato: M1,M2,Servo; servo incremental, limitado a 0..180 grados.\n\n");
 
     while (1) {
-        double d[NUM_MOTORES];
-        pedir_comando(&d[0], &d[1]);
+        double d[NUM_MOTORES + 1];
+        pedir_comando(&d[0], &d[1], &d[2]);
 
         bool alguno = false;
 
@@ -354,7 +409,7 @@ void app_main(void)
 
             // Compensación del redondeo: se acumula lo pedido y se calcula el paso objetivo
             // absoluto, así el error nunca pasa de medio paso (0.45 grados) por mucho que muevas.
-            m->ideal_grados += (i == 1) ? d[i] * 1.0825 : d[i] * 1.8;
+            m->ideal_grados += (i == 1) ? d[i] * 1.0826 : d[i] * 1.8;
             int32_t objetivo_pasos = (int32_t)llround(m->ideal_grados / GRADOS_POR_PASO);
             m->pasos_orden = objetivo_pasos - m->pos_pasos;
 
@@ -364,6 +419,11 @@ void app_main(void)
                    m->nombre, (long)m->pasos_orden, m->pasos_orden * GRADOS_POR_PASO,
                    m->ideal_grados, objetivo_pasos * GRADOS_POR_PASO,
                    objetivo_pasos * GRADOS_POR_PASO - m->ideal_grados);
+        }
+
+        if (fabs(d[2]) > 0.0) {
+            servo_fijar_grados(g_servo_grados + (float)d[2]);
+            printf("Servo: posicion %.1f grados\n", g_servo_grados);
         }
 
         if (!alguno) {

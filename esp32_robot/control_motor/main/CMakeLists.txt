@@ -1,3 +1,3 @@
 idf_component_register(SRCS "hello_world_main.c"
-                       PRIV_REQUIRES esp_driver_gpio esp_driver_uart esp_driver_gptimer esp_adc freertos log esp_rom
+                       PRIV_REQUIRES esp_driver_gpio esp_driver_uart esp_driver_gptimer esp_driver_ledc esp_adc freertos log esp_rom
                        INCLUDE_DIRS "")
