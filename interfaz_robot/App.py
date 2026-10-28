@@ -1,268 +1,222 @@
-import os
+#!/usr/bin/env python3
+"""
+Servidor Flask para el control del Robot RRP mediante cinemática inversa
+y comunicación serial hacia el ESP32.
+"""
+
 import threading
 import time
-from collections import deque
-
 import numpy as np
-import serial
 from flask import Flask, jsonify, request, send_from_directory
+import serial
 from serial.tools import list_ports
 
-# Importación de las funciones geométricas
-from cinematica_inv import cinematica_inversa, cinematica_directa
+# Configuramos Flask para servir archivos desde el directorio actual (.)
+app = Flask(__name__, static_folder='.', template_folder='.')
 
-# ==============================================================================
-# 1. PARÁMETROS CONFIGURABLES DEL ROBOT (MODIFICAR AQUÍ)
-# ==============================================================================
-L1 = 100.0                      # Longitud del eslabón 1 (cm / mm)
-L2 = 100.0                       # Longitud del eslabón 2 (cm / mm)
-CODO = "abajo"                 # Configuración geométrica: "abajo" o "arriba"
-PASO_JOG = 1.0                 # Desplazamiento manual en cada pulso de D-Pad
-Q1_MIN, Q1_MAX = -180.0, 180.0 # Límites mecánicos en grados (Motor 1)
-Q2_MIN, Q2_MAX = -150.0, 150.0 # Límites mecánicos en grados (Motor 2)
+# Variables globales de conexión
+conexion_serial = None
+hilo_lector = None
+detener_hilo = threading.Event()
+puerto_actual = None
+baudrate_actual = 115200
 
-# ==============================================================================
-# 2. CONFIGURACIÓN DEL SERVIDOR Y ESTADO GLOBAL
-# ==============================================================================
-CARPETA = os.path.dirname(os.path.abspath(__file__))
-app = Flask(__name__, static_folder=None)
-
-lock = threading.Lock()
-ser = None                     # Objeto serial.Serial activo
-detener_lector = threading.Event()
-bloqueado = False              # Estado de parada de emergencia
-
-# Posiciones y ángulos absolutos actuales del robot
-q_actual = [0.0, 0.0]          # [q1, q2] en grados (Inicia en posición Home: 0°, 0°)
-x_actual, y_actual, _ = cinematica_directa(0.0, 0.0, 0.0, L1, L2)
-
-log = deque(maxlen=300)        # Búfer circular para la consola de diagnóstico
-log_id = 0
+# Longitudes de los eslabones del robot RRP (en cm)
+L1 = 10.0
+L2 = 7.0
 
 
-def agregar_log(texto):
-    global log_id
-    with lock:
-        log_id += 1
-        log.append((log_id, f"[{time.strftime('%H:%M:%S')}] {texto}"))
+def cinematica_inversa(x, y, z, l1, l2, codo="abajo"):
+    """Cinemática inversa del robot RRP."""
+    q3 = z
+    r2 = x**2 + y**2
+    cos_q2 = (r2 - l1**2 - l2**2) / (2 * l1 * l2)
+
+    if abs(cos_q2) > 1 + 1e-9:
+        raise ValueError(
+            f"Punto fuera del espacio de trabajo: {abs(l1 - l2):.3f} <="
+            f" sqrt(x²+y²) <= {l1 + l2:.3f}"
+        )
+    cos_q2 = np.clip(cos_q2, -1.0, 1.0)
+
+    signo = 1 if codo == "abajo" else -1
+    sin_q2 = signo * np.sqrt(1 - cos_q2**2)
+
+    q2 = np.arctan2(sin_q2, cos_q2)
+    q1 = np.arctan2(y, x) - np.arctan2(l2 * sin_q2, l1 + l2 * np.cos(q2))
+
+    return q1, q2, q3
 
 
-# ==============================================================================
-# 3. LECTURA SERIAL EN SEGUNDO PLANO (RX)
-# ==============================================================================
-def hilo_lectura(puerto):
-    """Escucha las respuestas del ESP32 e ignora las líneas de telemetría Teleplot ('>')."""
+def hilo_lectura(ser, detener):
+    """Hilo para leer respuestas del ESP32 por el puerto serial."""
     buffer = ""
-    while not detener_lector.is_set():
+    while not detener.is_set():
         try:
-            datos = puerto.read(puerto.in_waiting or 1)
+            if ser and ser.is_open:
+                datos = ser.read(ser.in_waiting or 1)
+                if datos:
+                    buffer += datos.decode("utf-8", errors="replace")
+                    while "\n" in buffer:
+                        linea, buffer = buffer.split("\n", 1)
+                        print(f"[ESP32 RX]: {linea.strip()}")
+            else:
+                time.sleep(0.1)
         except (serial.SerialException, OSError):
-            agregar_log("WARN: Se perdió la conexión serial")
+            print("\n[Se perdió la conexión serial]")
             break
-        if not datos:
-            continue
-        buffer += datos.decode("utf-8", errors="replace")
-        while "\n" in buffer:
-            linea, buffer = buffer.split("\n", 1)
-            linea = linea.strip("\r ")
-            if linea and not linea.startswith(">"):
-                agregar_log(f"RX: {linea}")
 
 
-# ==============================================================================
-# 4. FUNCIÓN PRINCIPAL DE ENVÍO POR SERIE (SOLO DOS NEMA SEPARADOS POR COMA)
-# ==============================================================================
-def transmitir_angulos(q1_objetivo, q2_objetivo, es_relativo=True):
-    """
-    Calcula la trama y transmite únicamente los 2 valores de los motores NEMA.
-    Formato hacia la ESP32: "valor1,valor2\n"
-    """
-    global ser, q_actual
-
-    if ser is None or not ser.is_open:
-        raise RuntimeError("No hay conexión con el robot")
-    if bloqueado:
-        raise RuntimeError("Parada de emergencia activa")
-
-    # Validar límites de seguridad
-    if not (Q1_MIN <= q1_objetivo <= Q1_MAX and Q2_MIN <= q2_objetivo <= Q2_MAX):
-        raise ValueError(f"Ángulos fuera de rango: q1={q1_objetivo:.1f}°, q2={q2_objetivo:.1f}°")
-
-    if es_relativo:
-        # Calcular los deltas de movimiento (d1, d2)
-        d1 = q1_objetivo - q_actual[0]
-        d2 = q2_objetivo - q_actual[1]
-        trama = f"{d1:.3f},{d2:.3f}"
-    else:
-        # Envío directo de ángulos absolutos
-        trama = f"{q1_objetivo:.3f},{q2_objetivo:.3f}"
-
-    with lock:
-        # Transmisión por el puerto serie
-        ser.write((trama + "\n").encode("ascii"))
-        q_actual[0], q_actual[1] = q1_objetivo, q2_objetivo
-
-    agregar_log(f"TX: {trama} (q1={q1_objetivo:.2f}°, q2={q2_objetivo:.2f}°)")
-    return trama
+# =============================================================
+# RUTAS PARA SERVIR LA INTERFAZ WEB Y ARCHIVOS ESTÁTICOS
+# =============================================================
+@app.route('/')
+def servir_index():
+    return send_from_directory('.', 'index.html')
 
 
-# ==============================================================================
-# 5. RUTAS DE LA INTERFAZ Y ENDPOINTS API REST
-# ==============================================================================
-@app.route("/")
-def index():
-    return send_from_directory(CARPETA, "index.html")
+@app.route('/styles.css')
+def servir_css():
+    return send_from_directory('.', 'styles.css')
 
-@app.route("/index.js")
-def archivo_js():
-    return send_from_directory(CARPETA, "index.js")
 
-@app.route("/styles.css")
-def archivo_css():
-    return send_from_directory(CARPETA, "styles.css")
+@app.route('/index.js')
+def servir_js():
+    return send_from_directory('.', 'index.js')
 
-@app.get("/api/puertos")
-def api_puertos():
-    """Retorna únicamente los puertos serie físicos detectados en el sistema."""
-    return jsonify([p.device for p in list_ports.comports()])
 
-@app.post("/api/conectar")
-def api_conectar():
-    global ser, bloqueado
-    datos = request.get_json() or {}
-    puerto = datos.get("puerto")
-    baudios = int(datos.get("baudrate", 115200))
+# =============================================================
+# ENDPOINTS DE LA API
+# =============================================================
+@app.route('/api/puertos', methods=['GET'])
+def obtener_puertos():
+    puertos = list(list_ports.comports())
+    lista = [p.device for p in puertos]
+    return jsonify({'puertos': lista})
 
-    if not puerto:
-        return jsonify(error="No se especificó un puerto serial válido"), 400
 
-    if ser and ser.is_open:
-        return jsonify(error="Ya existe una conexión abierta"), 400
+@app.route('/api/conexion', methods=['POST'])
+def gestionar_conexion():
+    global conexion_serial, hilo_lector, detener_hilo, puerto_actual, baudrate_actual
 
-    nuevo = serial.Serial()
-    nuevo.port = puerto
-    nuevo.baudrate = baudios
-    nuevo.timeout = 0.1
-    # Configurar DTR/RTS en False evita reinicios del ESP32
-    nuevo.dtr = False
-    nuevo.rts = False
+    data = request.json
+    accion = data.get('accion')
+    puerto = data.get('puerto')
+    baudrate = int(data.get('baudrate', 115200))
 
-    try:
-        nuevo.open()
-    except serial.SerialException as e:
-        return jsonify(error=f"No se pudo abrir {puerto}: {e}"), 500
+    if accion == 'conectar':
+        if conexion_serial and conexion_serial.is_open:
+            return jsonify({'status': 'success', 'message': 'Ya está conectado.'})
+        try:
+            conexion_serial = serial.Serial()
+            conexion_serial.port = puerto
+            conexion_serial.baudrate = baudrate
+            conexion_serial.timeout = 0.1
+            conexion_serial.dtr = False
+            conexion_serial.rts = False
+            conexion_serial.open()
 
-    ser = nuevo
-    bloqueado = False
-    detener_lector.clear()
-    threading.Thread(target=hilo_lectura, args=(ser,), daemon=True).start()
-    agregar_log(f"CONECTADO A {puerto} @ {baudios} BAUDIOS")
-    return jsonify(estado())
+            puerto_actual = puerto
+            baudrate_actual = baudrate
 
-@app.post("/api/desconectar")
-def api_desconectar():
-    global ser
-    detener_lector.set()
-    if ser:
-        ser.close()
-        ser = None
-    agregar_log("DESCONECTADO DEL PUERTO SERIAL")
-    return jsonify(estado())
+            detener_hilo.clear()
+            hilo_lector = threading.Thread(
+                target=hilo_lectura, args=(conexion_serial, detener_hilo), daemon=True
+            )
+            hilo_lector.start()
 
-@app.post("/api/mover")
-def api_mover():
-    """Recibe (X, Y) desde la web, calcula Cinemática Inversa y manda 'd1,d2\\n'."""
-    global x_actual, y_actual
-    d = request.get_json() or {}
-    try:
-        x = float(d["x"])
-        y = float(d["y"])
+            return jsonify({
+                'status': 'success',
+                'message': f'Conectado exitosamente a {puerto}',
+            })
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 400
 
-        # Cálculo de la Cinemática Inversa
-        q1_rad, q2_rad, _ = cinematica_inversa(x, y, 0.0, L1, L2, CODO)
-        q1_deg = float(np.degrees(q1_rad))
-        q2_deg = float(np.degrees(q2_rad))
+    elif accion == 'desconectar':
+        try:
+            detener_hilo.set()
+            if conexion_serial and conexion_serial.is_open:
+                conexion_serial.close()
+            return jsonify(
+                {'status': 'success', 'message': 'Puerto desconectado correctamente.'}
+            )
+        except Exception as e:
+            return jsonify({'status': 'error', 'message': str(e)}), 400
 
-        trama = transmitir_angulos(q1_deg, q2_deg, es_relativo=True)
-        x_actual, y_actual = x, y
+    return jsonify({'status': 'error', 'message': 'Acción no válida.'}), 400
 
-    except (ValueError, RuntimeError) as e:
-        agregar_log(f"ERROR: {e}")
-        return jsonify(error=str(e)), 400
 
-    return jsonify(trama=trama, q1=q1_deg, q2=q2_deg, **estado())
+@app.route('/api/comando', methods=['POST'])
+def procesar_comando():
+    global conexion_serial
 
-@app.post("/api/angulos")
-def api_angulos():
-    """Recibe los ángulos directamente (q1, q2) y envía 'd1,d2\\n'."""
-    global x_actual, y_actual
-    d = request.get_json() or {}
-    try:
-        q1 = float(d["q1"])
-        q2 = float(d["q2"])
-
-        trama = transmitir_angulos(q1, q2, es_relativo=True)
-        x_actual, y_actual, _ = cinematica_directa(np.radians(q1), np.radians(q2), 0.0, L1, L2)
-
-    except (ValueError, RuntimeError) as e:
-        agregar_log(f"ERROR: {e}")
-        return jsonify(error=str(e)), 400
-
-    return jsonify(trama=trama, q1=q1, q2=q2, **estado())
-
-@app.post("/api/jog")
-def api_jog():
-    """Mueve el robot un paso discreto en el plano cartesiano X/Y."""
-    global x_actual, y_actual
-    direccion = request.get_json().get("dir")
-    dx, dy = {
-        "avanzar": (0, PASO_JOG),
-        "retroceder": (0, -PASO_JOG),
-        "izquierda": (-PASO_JOG, 0),
-        "derecha": (PASO_JOG, 0),
-    }.get(direccion, (0, 0))
+    data = request.json
+    trama_recibida = data.get('trama', '')
 
     try:
-        x_nuevo = x_actual + dx
-        y_nuevo = y_actual + dy
-        q1_rad, q2_rad, _ = cinematica_inversa(x_nuevo, y_nuevo, 0.0, L1, L2, CODO)
-        q1_deg = float(np.degrees(q1_rad))
-        q2_deg = float(np.degrees(q2_rad))
+        cuerpo = trama_recibida.strip().lstrip('$').split('*')[0]
+        partes = cuerpo.split(',')
+        comando = partes[0]
 
-        trama = transmitir_angulos(q1_deg, q2_deg, es_relativo=True)
-        x_actual, y_actual = x_nuevo, y_nuevo
+        respuesta_rx = ''
 
-    except (ValueError, RuntimeError) as e:
-        agregar_log(f"ERROR: {e}")
-        return jsonify(error=str(e)), 400
+        if comando == 'MOVE_XY':
+            x = float(partes[1])
+            y = float(partes[2])
+            z = 0.0
 
-    return jsonify(trama=trama, q1=q1_deg, q2=q2_deg, **estado())
+            q1, q2, q3 = cinematica_inversa(x, y, z, L1, L2, codo='abajo')
+            deg_m1 = np.degrees(q1)
+            deg_m2 = np.degrees(q2)
 
-@app.post("/api/emergencia")
-def api_emergencia():
-    global bloqueado
-    bloqueado = not bloqueado
-    agregar_log("PARADA DE EMERGENCIA ACTIVADA" if bloqueado else "Bloqueo liberado")
-    return jsonify(estado())
+            comando_esp = f'{deg_m1:.2f},{deg_m2:.2f}\n'
 
-@app.get("/api/estado")
-def api_estado():
-    return jsonify(estado())
+            if conexion_serial and conexion_serial.is_open:
+                conexion_serial.write(comando_esp.encode('ascii'))
+                print(f'[Flask TX al ESP32]: {comando_esp.strip()}')
+                respuesta_rx = f'Enviado al ESP32: {comando_esp.strip()}'
+            else:
+                return (
+                    jsonify({
+                        'status': 'error',
+                        'message': 'No hay conexión serial activa con el ESP32.',
+                    }),
+                    400,
+                )
 
-@app.get("/api/log")
-def api_log():
-    desde = int(request.args.get("desde", 0))
-    with lock:
-        nuevos = [(i, t) for i, t in log if i > desde]
-    return jsonify(nuevos)
+        elif comando == 'MOVE_ANG':
+            m1 = float(partes[1])
+            m2 = float(partes[2])
+            comando_esp = f'{m1},{m2}\n'
 
-def estado():
-    return {
-        "conectado": bool(ser and ser.is_open),
-        "bloqueado": bloqueado,
-        "x": x_actual, "y": y_actual,
-        "q1": q_actual[0], "q2": q_actual[1],
-    }
+            if conexion_serial and conexion_serial.is_open:
+                conexion_serial.write(comando_esp.encode('ascii'))
+                respuesta_rx = f'Enviado al ESP32 (Ángulos): {m1},{m2}'
+            else:
+                return (
+                    jsonify({
+                        'status': 'error',
+                        'message': 'Puerto serial desconectado.',
+                    }),
+                    400,
+                )
 
-if __name__ == "__main__":
-    app.run(debug=False, threaded=True, host="127.0.0.1", port=5000)
+        else:
+            if conexion_serial and conexion_serial.is_open:
+                conexion_serial.write(f'{trama_recibida}\n'.encode('ascii'))
+                respuesta_rx = f'Enviado comando: {trama_recibida}'
+
+        return jsonify({
+            'status': 'success',
+            'message': 'Comando procesado con éxito.',
+            'rx': respuesta_rx,
+        })
+
+    except ValueError as ve:
+        return jsonify({'status': 'error', 'message': f'Error geométrico: {ve}'}), 400
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=True)

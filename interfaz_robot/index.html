@@ -14,7 +14,7 @@
 
         <!-- Encabezado con resplandor dorado -->
         <header class="head-container">
-            <h1 class="head-title">Control de Robot RRP</h1>
+            <h1 class="head-title">Control de Robot </h1>
         </header>
 
         <main>
@@ -41,7 +41,7 @@
                 <div class="connection-actions" role="group" aria-label="Acciones de conexión">
                     <button type="button" id="conectar">Conectar</button>
                     <span id="estado-conexion" role="status" aria-live="polite" aria-label="Desconectado">
-                        <span id="indicador-conexion" aria-hidden="true" style="display: inline-block; width: 12px; height: 12px; margin-right: 6px; border-radius: 50%; background-color: #b42318;"></span>
+                        <span id="indicador-conexion" aria-hidden="true"></span>
                         <span id="texto-estado-conexion">Desconectado</span>
                     </span>
                 </div>
@@ -96,44 +96,43 @@
                     </div>
                 </div>
 
-                <!-- 2. Posicionamiento por Coordenadas Cartesianas (X, Y) -->
-                <div class="control-box" style="margin: 1.2rem 0; padding: 1rem; background: rgba(5, 8, 20, 0.6); border: 1px solid rgba(240, 215, 154, 0.2); border-radius: 8px;">
-                    <p style="font-size: 0.85rem; color: #F0D79A; margin-bottom: 0.8rem; font-weight: 600; text-align: center;">POSICIONAMIENTO POR COORDENADAS (X, Y)</p>
-                    <div style="display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center; align-items: center;">
-                        <div style="display: flex; flex-direction: column; gap: 0.3rem;">
-                            <label for="coord-x" style="font-size: 0.8rem; color: #F8F6EE;">Coordenada X (mm):</label>
-                            <input type="number" id="coord-x" value="12.0" step="0.5" style="width: 100px; padding: 0.4rem; background: #0A1026; color: #F0D79A; border: 1px solid rgba(240, 215, 154, 0.3); border-radius: 6px; outline: none;" />
+                <!-- 2. Posicionamiento por Coordenadas Cartesianas (X, Y) con máx 10 cm y precisión de 1 mm (0.1 cm) -->
+                <div class="control-box">
+                    <p class="control-box-title">POSICIONAMIENTO POR COORDENADAS (X, Y)</p>
+                    <div class="control-box-inputs">
+                        <div class="input-group">
+                            <label for="coord-x">Coordenada X (cm):</label>
+                            <input type="number" id="coord-x" class="coord-input"  min="0" max="10" step="0.1" />
                         </div>
-                        <div style="display: flex; flex-direction: column; gap: 0.3rem;">
-                            <label for="coord-y" style="font-size: 0.8rem; color: #F8F6EE;">Coordenada Y (mm):</label>
-                            <input type="number" id="coord-y" value="5.0" step="0.5" style="width: 100px; padding: 0.4rem; background: #0A1026; color: #F0D79A; border: 1px solid rgba(240, 215, 154, 0.3); border-radius: 6px; outline: none;" />
+                        <div class="input-group">
+                            <label for="coord-y">Coordenada Y (cm):</label>
+                            <input type="number" id="coord-y" class="coord-input" min="0" max="10" step="0.1" />
                         </div>
-                        <button type="button" id="btn-mover-coordenadas" style="padding: 0.5rem 1rem; background: #142B52; color: #F0D79A; border: 1px solid #F0D79A; border-radius: 6px; cursor: pointer; font-family: inherit; font-weight: 500; align-self: flex-end;">Mover a (X, Y)</button>
+                        <button type="button" id="btn-mover-coordenadas">Mover a (X, Y)</button>
                     </div>
                 </div>
 
                 <!-- 3. Posicionamiento Angular Directo (Motor 1, Motor 2) -->
-                <div class="control-box" style="margin: 1.2rem 0; padding: 1rem; background: rgba(5, 8, 20, 0.6); border: 1px solid rgba(240, 215, 154, 0.2); border-radius: 8px;">
-                    <p style="font-size: 0.85rem; color: #F0D79A; margin-bottom: 0.8rem; font-weight: 600; text-align: center;">POSICIONAMIENTO ANGULAR (GRADOS)</p>
-                    <div style="display: flex; flex-wrap: wrap; gap: 1rem; justify-content: center; align-items: center;">
-                        <div style="display: flex; flex-direction: column; gap: 0.3rem;">
-                            <label for="grados-m1" style="font-size: 0.8rem; color: #F8F6EE;">Motor 1 (°):</label>
-                            <input type="number" id="grados-m1" value="0" min="-180" max="180" step="1" style="width: 90px; padding: 0.4rem; background: #0A1026; color: #F0D79A; border: 1px solid rgba(240, 215, 154, 0.3); border-radius: 6px; outline: none;" />
+                <div class="control-box">
+                    <p class="control-box-title">POSICIONAMIENTO ANGULAR (GRADOS)</p>
+                    <div class="control-box-inputs">
+                        <div class="input-group">
+                            <label for="grados-m1">Motor 1 (°):</label>
+                            <input type="number" id="grados-m1" value="0" min="-180" max="180" step="1" />
                         </div>
-                        <div style="display: flex; flex-direction: column; gap: 0.3rem;">
-                            <label for="grados-m2" style="font-size: 0.8rem; color: #F8F6EE;">Motor 2 (°):</label>
-                            <input type="number" id="grados-m2" value="0" min="-180" max="180" step="1" style="width: 90px; padding: 0.4rem; background: #0A1026; color: #F0D79A; border: 1px solid rgba(240, 215, 154, 0.3); border-radius: 6px; outline: none;" />
+                        <div class="input-group">
+                            <label for="grados-m2">Motor 2 (°):</label>
+                            <input type="number" id="grados-m2" value="0" min="-180" max="180" step="1" />
                         </div>
-                        <button type="button" id="btn-mover-grados" style="padding: 0.5rem 1rem; background: #142B52; color: #F0D79A; border: 1px solid #F0D79A; border-radius: 6px; cursor: pointer; font-family: inherit; font-weight: 500; align-self: flex-end;">Mover Ángulos</button>
+                        <button type="button" id="btn-mover-grados">Mover Ángulos</button>
                     </div>
                 </div>
 
-                <!-- 4. Control del Servo (Eje Z: Estado 0 = Arriba, 1 = Abajo) -->
-                <div class="control-box" style="margin: 1.2rem 0; padding: 1rem; background: rgba(5, 8, 20, 0.6); border: 1px solid rgba(240, 215, 154, 0.2); border-radius: 8px;">
-                    <p style="font-size: 0.85rem; color: #F0D79A; margin-bottom: 0.8rem; font-weight: 600; text-align: center;">CONTROL SERVO EJE Z (0 = ARRIBA / 1 = ABAJO)</p>
-                    <div style="display: flex; gap: 1rem; justify-content: center; align-items: center;">
-                        <button type="button" id="btn-z-arriba" style="padding: 0.6rem 1.2rem; background: #142B52; color: #F0D79A; border: 1px solid #F0D79A; border-radius: 6px; cursor: pointer; font-family: inherit; font-weight: 600; transition: all 0.2s;">▲ Subir Z (0)</button>
-                        <button type="button" id="btn-z-abajo" style="padding: 0.6rem 1.2rem; background: #142B52; color: #F0D79A; border: 1px solid #F0D79A; border-radius: 6px; cursor: pointer; font-family: inherit; font-weight: 600; transition: all 0.2s;">▼ Bajar Z (1)</button>
+                <!-- 4. Referenciación / Posición de Origen (Home) -->
+                <div class="control-box">
+                    <p class="control-box-title">POSICIÓN DE ORIGEN (HOME / CALIBRACIÓN)</p>
+                    <div class="control-box-actions">
+                        <button type="button" id="btn-home" class="btn-home"> Home (0, 0)</button>
                     </div>
                 </div>
 
@@ -143,8 +142,6 @@
                     <input type="range" id="velocidad" name="velocidad" min="0" max="100" value="50" step="1"
                         aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" />
                 </div>
-                
-                <button type="button" id="stop">Parada de emergencia</button>
             </section>
 
             <!-- Panel de Supervisión y Diagnóstico Serial -->
@@ -157,7 +154,7 @@
                         <output id="visor-trama" aria-live="polite">--</output>
                     </div>
 
-                    <div style="margin: 8px 0;">
+                    <div class="checksum-container">
                         <span id="estado-checksum" role="status" aria-live="polite">--</span>
                     </div>
 
@@ -165,6 +162,18 @@
                         <p>CONSOLA DE DIAGNÓSTICO (RX/TX):</p>
                         <div id="consola-log" role="log" aria-live="polite" aria-label="Registro de diagnóstico"></div>
                     </div>
+
+                    <!-- Control del Servo (Eje Z: Estado 0 = Arriba, 1 = Abajo) -->
+                    <div class="control-box">
+                        <p class="control-box-title">CONTROL SERVO EJE Z (0 = ARRIBA / 1 = ABAJO)</p>
+                        <div class="control-box-actions">
+                            <button type="button" id="btn-z-arriba" class="btn-z">▲ Subir Z (0)</button>
+                            <button type="button" id="btn-z-abajo" class="btn-z">▼ Bajar Z (1)</button>
+                        </div>
+                    </div>
+
+                    <!-- Parada de Emergencia / STOP -->
+                    <button type="button" id="stop">Parada de emergencia</button>
                 </div>
             </section>
         </main>
