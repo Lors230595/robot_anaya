@@ -2,7 +2,7 @@
 <html lang="es">
 
     <head>
-        <title>Control Robot RRP | Tic Tac Toe</title>
+        <title>Control Robot </title>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <link rel="stylesheet" href="styles.css" />
@@ -102,11 +102,11 @@
                     <div class="control-box-inputs">
                         <div class="input-group">
                             <label for="coord-x">Coordenada X (cm):</label>
-                            <input type="number" id="coord-x" class="coord-input"  min="0" max="10" step="0.1" />
+                            <input type="number" id="coord-x" class="coord-input"  min="-20" max="20" step="0.1" />
                         </div>
                         <div class="input-group">
                             <label for="coord-y">Coordenada Y (cm):</label>
-                            <input type="number" id="coord-y" class="coord-input" min="0" max="10" step="0.1" />
+                            <input type="number" id="coord-y" class="coord-input" min="-20" max="20" step="0.1" />
                         </div>
                         <button type="button" id="btn-mover-coordenadas">Mover a (X, Y)</button>
                     </div>
@@ -122,7 +122,7 @@
                         </div>
                         <div class="input-group">
                             <label for="grados-m2">Motor 2 (°):</label>
-                            <input type="number" id="grados-m2" value="0" min="-180" max="180" step="1" />
+                            <input type="number" id="grados-m2" value="0" min="-180" max="270" step="1" />
                         </div>
                         <button type="button" id="btn-mover-grados">Mover Ángulos</button>
                     </div>
