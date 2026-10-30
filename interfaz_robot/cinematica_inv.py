@@ -1,47 +1,73 @@
 import numpy as np
 
-def cinematica_inversa(x, y, z, l1, l2, codo="abajo"):
-    """
-    Cinemática inversa del robot RRP (Planar RR + Prismatico Z).
+# Funciones trigonométricas en grados
+def sind(a):
+    return np.sin(np.radians(a))
 
-    Parámetros:
-        x, y, z : Coordenadas del efector final
-        l1, l2  : Longitudes de los eslabones
-        codo    : "abajo" (q2 > 0) o "arriba" (q2 < 0)
+def cosd(a):
+    return np.cos(np.radians(a))
 
-    Retorna:
-        (q1, q2, q3) con q1 y q2 en RADIANES y q3 igual a z.
-    """
-    # Articulación prismática en Z
-    q3 = z
-
-    # Distancia al cuadrado en el plano XY
-    r2 = x**2 + y**2
-    cos_q2 = (r2 - l1**2 - l2**2) / (2 * l1 * l2)
-
-    # Verificar alcanzabilidad geométrica del espacio de trabajo
-    if abs(cos_q2) > 1 + 1e-9:
-        raise ValueError(
-            f"Punto fuera del espacio de trabajo: "
-            f"{abs(l1 - l2):.2f} <= sqrt(x²+y²) <= {l1 + l2:.2f}"
-        )
-    cos_q2 = np.clip(cos_q2, -1.0, 1.0)
-
-    # Selección de solución geométrica (codo arriba / codo abajo)
-    signo = 1 if codo == "abajo" else -1
-    sin_q2 = signo * np.sqrt(1 - cos_q2**2)
-
-    q2 = np.arctan2(sin_q2, cos_q2)
-    q1 = np.arctan2(y, x) - np.arctan2(l2 * sin_q2, l1 + l2 * np.cos(q2))
-
-    return q1, q2, q3
+def atan2d(y, x):
+    return np.degrees(np.arctan2(y, x))
 
 
 def cinematica_directa(q1, q2, q3, l1, l2):
     """
-    Calcula la posición cartesiana (x, y, z) a partir de los ángulos de articulación.
-    Nota: q1 y q2 deben estar en RADIANES.
+    Cinemática directa del robot RRP.
+
+    Parámetros:
+        q1, q2 : ángulos en GRADOS
+        q3     : desplazamiento prismático
+        l1, l2 : longitudes de los eslabones
+
+    Retorna:
+        x, y, z
     """
-    x = l1 * np.cos(q1) + l2 * np.cos(q1 + q2)
-    y = l1 * np.sin(q1) + l2 * np.sin(q1 + q2)
-    return x, y, q3
+    x = l1 * cosd(q1) + l2 * cosd(q1 + q2)
+    y = l1 * sind(q1) + l2 * sind(q1 + q2)
+    z = q3
+
+    return x, y, z
+
+
+def cinematica_inversa(x, y, z, l1, l2, codo=1):
+    """
+    Cinemática inversa del robot RRP.
+
+    Parámetros:
+        x, y, z : posición deseada del efector
+        l1, l2  : longitudes de los eslabones
+        codo    : +1 (q2 > 0) o -1 (q2 < 0)
+
+    Retorna:
+        q1, q2 en GRADOS, q3 = z
+    """
+    cos_q2 = (x**2 + y**2 - l1**2 - l2**2) / (2 * l1 * l2)
+    if not -1 <= cos_q2 <= 1:
+        raise ValueError("La posición no es alcanzable con esas longitudes.")
+
+    sin_q2 = codo * np.sqrt(1 - cos_q2**2)
+
+    q2 = atan2d(sin_q2, cos_q2)
+    q1 = atan2d(y, x) - atan2d(l2 * sin_q2, l1 + l2 * cos_q2)
+    q3 = z
+
+    return q1, q2, q3
+
+
+if __name__ == "__main__":
+    print("Cinemática inversa del robot RRP")
+    l1 = float(input("Ingrese la longitud del eslabón l1: "))
+    l2 = float(input("Ingrese la longitud del eslabón l2: "))
+    x = float(input("Ingrese x: "))
+    y = float(input("Ingrese y: "))
+    z = float(input("Ingrese z: "))
+    codo = int(input("Ingrese la configuración del codo (1 o -1): "))
+
+    try:
+        q1, q2, q3 = cinematica_inversa(x, y, z, l1, l2, codo)
+        print(f"q1 = {q1:.2f} grados")
+        print(f"q2 = {q2:.2f} grados")
+        print(f"q3 = {q3:.2f}")
+    except ValueError as error:
+        print(f"Error: {error}")

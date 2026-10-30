@@ -2,7 +2,7 @@
 <html lang="es">
 
     <head>
-        <title>Control Robot </title>
+        <title>Control Robot RRP | Tic Tac Toe</title>
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <link rel="stylesheet" href="styles.css" />
@@ -102,11 +102,11 @@
                     <div class="control-box-inputs">
                         <div class="input-group">
                             <label for="coord-x">Coordenada X (cm):</label>
-                            <input type="number" id="coord-x" class="coord-input"  min="-20" max="20" step="0.1" />
+                            <input type="number" id="coord-x" class="coord-input" value=""  min="-17" max="17" step="0.1" />
                         </div>
                         <div class="input-group">
                             <label for="coord-y">Coordenada Y (cm):</label>
-                            <input type="number" id="coord-y" class="coord-input" min="-20" max="20" step="0.1" />
+                            <input type="number" id="coord-y" class="coord-input" value="" min="-17" max="17" step="0.1" />
                         </div>
                         <button type="button" id="btn-mover-coordenadas">Mover a (X, Y)</button>
                     </div>
@@ -118,30 +118,19 @@
                     <div class="control-box-inputs">
                         <div class="input-group">
                             <label for="grados-m1">Motor 1 (°):</label>
-                            <input type="number" id="grados-m1" value="0" min="-180" max="180" step="1" />
+                            <input type="number" id="grados-m1" value="" min="-180" max="180" step="1" />
                         </div>
                         <div class="input-group">
                             <label for="grados-m2">Motor 2 (°):</label>
-                            <input type="number" id="grados-m2" value="0" min="-180" max="270" step="1" />
+                            <input type="number" id="grados-m2" value="" min="-180" max="180" step="1" />
                         </div>
                         <button type="button" id="btn-mover-grados">Mover Ángulos</button>
                     </div>
                 </div>
 
-                <!-- 4. Referenciación / Posición de Origen (Home) -->
-                <div class="control-box">
-                    <p class="control-box-title">POSICIÓN DE ORIGEN (HOME / CALIBRACIÓN)</p>
-                    <div class="control-box-actions">
-                        <button type="button" id="btn-home" class="btn-home"> Home (0, 0)</button>
-                    </div>
-                </div>
+                
 
-                <!-- Ajuste Dinámico de Velocidad -->
-                <div class="speed-control">
-                    <label for="velocidad">Velocidad: <output id="valor-velocidad">50</output>%</label>
-                    <input type="range" id="velocidad" name="velocidad" min="0" max="100" value="50" step="1"
-                        aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" />
-                </div>
+               
             </section>
 
             <!-- Panel de Supervisión y Diagnóstico Serial -->
@@ -162,7 +151,7 @@
                         <p>CONSOLA DE DIAGNÓSTICO (RX/TX):</p>
                         <div id="consola-log" role="log" aria-live="polite" aria-label="Registro de diagnóstico"></div>
                     </div>
-
+                    
                     <!-- Control del Servo (Eje Z: Estado 0 = Arriba, 1 = Abajo) -->
                     <div class="control-box">
                         <p class="control-box-title">CONTROL SERVO EJE Z (0 = ARRIBA / 1 = ABAJO)</p>

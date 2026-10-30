@@ -513,3 +513,16 @@ input[type="range"]:hover {
   align-items: center;
   font-size: 0.85rem;
 }
+/* Permite que los clics atraviesen las cajas transparentes */
+.star-btn,
+.star-svg-layer {
+    pointer-events: none !important;
+}
+
+/* Activa la interacción únicamente en las formas de las puntas y el centro */
+.star-shape,
+.star-icon,
+.star-center-shape {
+    pointer-events: visiblePainted !important;
+    cursor: pointer;
+}
