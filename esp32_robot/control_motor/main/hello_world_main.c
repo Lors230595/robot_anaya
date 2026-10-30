@@ -1,111 +1,129 @@
 #include <stdio.h>
-#include <stdbool.h>
+#include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
 
 // =====================================================================
-//  PRUEBA DE LOS LIMIT SWITCHES (solo lectura, sin motores)
-//  Dos tareas TOTALMENTE INDEPENDIENTES: limit1 (eslabon 1) y limit2 (eslabon 2).
-//  - Cada tarea lee SOLO su pin y usa SOLO sus propias variables.
-//  - No comparten nada: una no sabe que hace la otra.
-//  - Cada tarea imprime SOLO cuando SU switch cambia.
+//  ANGULO DEL ESLABON 1 CON POTENCIOMETRO (sin motores)
 //
-//  Ejemplo:
-//     E1home=no         (estado inicial de E1)
-//     E2home=no         (estado inicial de E2)
-//     E1home=si         (presionas E1)
-//     E2home=si         (presionas E2)
-//     E1home=no         (sueltas E1)
+//  Conexion:
+//     Terminal 1 (un extremo)  -> 3.3 V   (NUNCA a 5 V)
+//     Terminal 2 (el central)  -> pin ADC1 (senal)
+//     Terminal 3 (otro extremo)-> GND
+//
+//  Imprime SOLO cuando el angulo del brazo cambia mas de UMBRAL_GRADOS.
 // =====================================================================
 
-// --- PINES ---
-#define LIMIT1_GPIO          GPIO_NUM_32    // eslabon 1
-#define LIMIT2_GPIO          GPIO_NUM_34    // eslabon 2
+// --- PIN DEL POTENCIOMETRO ---
+// Cambia POT_CANAL si usas otro pin (solo pines de ADC1):
+//   GPIO36 = ADC_CHANNEL_0 | GPIO39 = ADC_CHANNEL_3
+//   GPIO33 = ADC_CHANNEL_5 | GPIO35 = ADC_CHANNEL_7
+#define POT_UNIDAD           ADC_UNIT_1
+#define POT_CANAL            ADC_CHANNEL_7      // GPIO35
 
-// Nivel que lee el pin cuando el switch ESTA PRESIONADO ("si" en pantalla).
-// Tus modulos dan 0 al presionar y 1 en reposo.
-// Si sale "si" sin presionar, invierte este valor.
-#define LIMIT_NIVEL_ACTIVO   0
+// --- CALIBRACION DEL POTENCIOMETRO (lectura -> grados del potenciometro) ---
+#define RAW_MIN              0
+#define RAW_MAX              4095
+#define ANGULO_MAX           270.0f     // recorrido total del potenciometro
 
-// --- AJUSTE DE RESPUESTA ---
-// El periodo debe ser de 10 ms o mas (tick de FreeRTOS), si no salta el watchdog.
-#define PERIODO_LECTURA_MS   10    // cada cuanto se lee el pin
-#define LECTURAS_ESTABLES    2     // lecturas iguales seguidas para aceptar un cambio (antirrebote)
+// --- CALIBRACION DEL BRAZO (grados del potenciometro -> grados del brazo) ---
+// Medido en tu brazo:
+//   brazo en 0°     -> potenciometro en 270° (tope del potenciometro)
+//   brazo en ~5°    -> el potenciometro empieza a bajar de 270°
+//   brazo en 90°    -> potenciometro en 185°
+//   brazo en maximo -> potenciometro en 162°
+// El potenciometro baja 1° por cada 1° del brazo, y esta "pegado" a su tope
+// los primeros ~5° del brazo (zona muerta). Por eso:
+//
+//     angulo_brazo = (ANGULO_POT_HOME + ZONA_MUERTA_GRADOS) - angulo_pot
+//
+//   Comprobacion: pot 185° -> (270 + 5) - 185 = 90°  (correcto)
+//                 pot 162° -> (270 + 5) - 162 = 113° (angulo maximo del brazo)
+#define ANGULO_POT_HOME      270.0f     // lo que marca el potenciometro con el brazo en 0°
+#define ZONA_MUERTA_GRADOS   5.0f       // grados que mueve el brazo antes de que el pot empiece a bajar
+#define TOLERANCIA_HOME      1.0f       // si el pot marca >= (270 - 1) se toma el brazo como 0°
 
-// --- CONFIGURACION DE LAS TAREAS ---
-#define TAREA_STACK          3072
-#define TAREA_PRIORIDAD      5
+// --- FILTRO Y SALIDA ---
+#define MUESTRAS_PROMEDIO    64      // lecturas que se promedian en cada medicion (reduce ruido)
+#define PERIODO_LECTURA_MS   50      // cada cuanto se mide
+#define ALFA_FILTRO          0.2f    // filtro suave: 0.05 = muy estable/lento, 1.0 = sin filtro
+#define UMBRAL_GRADOS        1.0f    // cambio minimo del brazo para imprimir
 
-// Datos que recibe cada tarea (solo el pin y el nombre; el estado es local de cada tarea)
-typedef struct {
-    gpio_num_t  pin;
-    const char *nombre;
-} limit_cfg_t;
-
-static const limit_cfg_t CFG_LIMIT1 = { .pin = LIMIT1_GPIO, .nombre = "E1" };
-static const limit_cfg_t CFG_LIMIT2 = { .pin = LIMIT2_GPIO, .nombre = "E2" };
-
-// ---------------------------------------------------------------------
-//  TAREA: vigila UN limit switch. Se crea una vez por cada eslabon.
-//  Todas sus variables son locales: cada tarea tiene las suyas.
-// ---------------------------------------------------------------------
-static void tarea_limit(void *arg)
+// Promedia varias lecturas del ADC para reducir el ruido
+static int leer_promedio(adc_oneshot_unit_handle_t adc)
 {
-    const limit_cfg_t *cfg = (const limit_cfg_t *)arg;
-
-    // Estado inicial: se imprime una sola vez
-    int nivel_estable = gpio_get_level(cfg->pin);
-    printf("%shome=%s\n", cfg->nombre, (nivel_estable == LIMIT_NIVEL_ACTIVO) ? "si" : "no");
-
-    // Nivel que se evalua como posible cambio y cuantas veces seguidas se ha visto
-    int nivel_candidato = nivel_estable;
-    int contador = 0;
-
-    while (1) {
-        int nivel = gpio_get_level(cfg->pin);
-
-        if (nivel != nivel_estable) {
-            // El pin es distinto al estado confirmado: se cuenta cuantas veces seguidas
-            if (nivel == nivel_candidato) {
-                contador++;
-            } else {
-                nivel_candidato = nivel;
-                contador = 1;
-            }
-            // Si el cambio se mantuvo suficiente tiempo, se acepta y se imprime
-            if (contador >= LECTURAS_ESTABLES) {
-                nivel_estable = nivel;
-                contador = 0;
-                printf("%shome=%s\n", cfg->nombre, (nivel_estable == LIMIT_NIVEL_ACTIVO) ? "si" : "no");
-            }
-        } else {
-            // Sin cambio: se descarta cualquier cambio a medias (rebote o ruido)
-            contador = 0;
-        }
-
-        // Espera hasta la siguiente lectura (cede la CPU a las demas tareas)
-        vTaskDelay(pdMS_TO_TICKS(PERIODO_LECTURA_MS));
+    int suma = 0;
+    for (int i = 0; i < MUESTRAS_PROMEDIO; i++) {
+        int raw = 0;
+        ESP_ERROR_CHECK(adc_oneshot_read(adc, POT_CANAL, &raw));
+        suma += raw;
     }
+    return suma / MUESTRAS_PROMEDIO;
+}
+
+// Lectura cruda -> grados del potenciometro (0..270)
+static float raw_a_grados_pot(int raw)
+{
+    float g = (float)(raw - RAW_MIN) * ANGULO_MAX / (float)(RAW_MAX - RAW_MIN);
+    if (g < 0.0f) g = 0.0f;
+    if (g > ANGULO_MAX) g = ANGULO_MAX;
+    return g;
+}
+
+// Grados del potenciometro -> grados del brazo (0 = posicion home)
+static float grados_pot_a_brazo(float pot)
+{
+    // Zona muerta: el pot esta en su tope, el brazo esta en 0° (o a menos de ~5°)
+    if (pot >= ANGULO_POT_HOME - TOLERANCIA_HOME) return 0.0f;
+
+    float brazo = (ANGULO_POT_HOME + ZONA_MUERTA_GRADOS) - pot;
+    if (brazo < 0.0f) brazo = 0.0f;
+    return brazo;
 }
 
 void app_main(void)
 {
-    // Pines como entrada. El modulo ya trae su propia resistencia;
-    // GPIO34 no tiene pull-up/pull-down interno.
-    gpio_config_t cfg = {
-        .pin_bit_mask = (1ULL << LIMIT1_GPIO) | (1ULL << LIMIT2_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE
+    // Inicia el ADC1 en modo lectura unica
+    adc_oneshot_unit_handle_t adc;
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = POT_UNIDAD,
     };
-    ESP_ERROR_CHECK(gpio_config(&cfg));
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc));
+
+    // Canal del potenciometro: atenuacion de 12 dB para leer hasta ~3.1 V
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,      // 0..4095
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc, POT_CANAL, &chan_cfg));
 
     vTaskDelay(pdMS_TO_TICKS(300));
-    printf("\n=== Prueba limit switches: E1 (GPIO32) y E2 (GPIO34) ===\n");
+    printf("\n=== Angulo del eslabon 1 con potenciometro ===\n");
 
-    // Dos tareas independientes, una por switch
-    xTaskCreate(tarea_limit, "limit1", TAREA_STACK, (void *)&CFG_LIMIT1, TAREA_PRIORIDAD, NULL);
-    xTaskCreate(tarea_limit, "limit2", TAREA_STACK, (void *)&CFG_LIMIT2, TAREA_PRIORIDAD, NULL);
+    // Lectura inicial: se imprime una sola vez
+    int raw = leer_promedio(adc);
+    float pot = raw_a_grados_pot(raw);
+    float pot_filtrado = pot;                       // angulo del pot ya suavizado
+    float brazo = grados_pot_a_brazo(pot_filtrado);
+    float ultimo_impreso = brazo;
+    printf("Eslabon 1: %.1f grados   (potenciometro=%.1f, raw=%d)\n", brazo, pot_filtrado, raw);
+
+    while (1) {
+        raw = leer_promedio(adc);
+        pot = raw_a_grados_pot(raw);
+
+        // Filtro suave: el angulo filtrado sigue al medido poco a poco
+        pot_filtrado += ALFA_FILTRO * (pot - pot_filtrado);
+        brazo = grados_pot_a_brazo(pot_filtrado);
+
+        // Solo imprime cuando el angulo del brazo cambio lo suficiente
+        if (fabsf(brazo - ultimo_impreso) >= UMBRAL_GRADOS) {
+            ultimo_impreso = brazo;
+            printf("Eslabon 1: %.1f grados   (potenciometro=%.1f, raw=%d)\n", brazo, pot_filtrado, raw);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(PERIODO_LECTURA_MS));
+    }
 }
