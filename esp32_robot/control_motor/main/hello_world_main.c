@@ -9,7 +9,6 @@
 #include "driver/uart.h"
 #include "driver/gptimer.h"
 #include "driver/ledc.h"
-#include "esp_adc/adc_oneshot.h"
 #include "esp_attr.h"
 
 // =====================================================================
@@ -25,10 +24,6 @@
 
 #define SERVO_GPIO         GPIO_NUM_18
 
-// Potenciometro en GPIO36 (ADC1_CH0)
-#define POT_UNIDAD         ADC_UNIT_1
-#define POT_CANAL          ADC_CHANNEL_0   // GPIO36
-
 // =====================================================================
 //  SENTIDOS (cambia si un motor va al reves)
 // =====================================================================
@@ -43,18 +38,8 @@
 #define MAX_GRADOS_ENTRADA 3600.0
 
 // =====================================================================
-//  MOTOR 1 (potenciometro, lazo cerrado)
+//  MOTOR 1 (lazo abierto)
 // =====================================================================
-#define POT_RAW_MAX           4095
-#define POT_ANGULO_MAX        270.0f
-#define POT_MUESTRAS          64
-#define M1_TOLERANCIA         1.0f     // grados
-#define M1_ANG_MIN            0.0f
-#define M1_ANG_MAX            270.0f
-#define M1_MAX_CORRECCIONES   10
-#define M1_SEG_MAX_PASOS      400
-#define ESTABILIZACION_MS     150
-
 // =====================================================================
 //  RAMPA
 // =====================================================================
@@ -112,7 +97,6 @@ static motor_t M2 = {
     .dir_positivo = M2_DIR_POSITIVO, .numero = 2,
 };
 
-static adc_oneshot_unit_handle_t g_adc;
 static TaskHandle_t g_tarea_main;
 static volatile double g_inc1 = 0.0;
 static volatile double g_inc2 = 0.0;
@@ -199,23 +183,6 @@ static bool IRAM_ATTR timer_isr_cb(gptimer_handle_t timer,
 }
 
 // =====================================================================
-//  POTENCIOMETRO (grados del pot: 0..270)
-// =====================================================================
-static float leer_pot_grados(void)
-{
-    int suma = 0;
-    for (int i = 0; i < POT_MUESTRAS; i++) {
-        int raw = 0;
-        ESP_ERROR_CHECK(adc_oneshot_read(g_adc, POT_CANAL, &raw));
-        suma += raw;
-    }
-    float g = (float)(suma / POT_MUESTRAS) * POT_ANGULO_MAX / (float)POT_RAW_MAX;
-    if (g < 0.0f) g = 0.0f;
-    if (g > POT_ANGULO_MAX) g = POT_ANGULO_MAX;
-    return g;
-}
-
-// =====================================================================
 //  SERVO
 // =====================================================================
 static void servo_fijar_grados(float grados)
@@ -268,49 +235,18 @@ static resultado_mov_t mover_pasos(motor_t *m, int32_t pasos)
 }
 
 // =====================================================================
-//  FUNCION MOTOR 1: va a un angulo absoluto del potenciometro
-//  objetivo = pot_actual + incremento (sin relacion)
+//  FUNCION MOTOR 1: lazo abierto por grados incrementales
 // =====================================================================
 static void mover_motor1(double incremento)
 {
     if (fabs(incremento) < 1e-9) return;
 
-    float pot = leer_pot_grados();
-    float objetivo = pot + (float)incremento;
-
-    if (objetivo < M1_ANG_MIN) {
-        printf("M1: limitado a %.1f grados (minimo)\n", M1_ANG_MIN);
-        objetivo = M1_ANG_MIN;
-    }
-    if (objetivo > M1_ANG_MAX) {
-        printf("M1: limitado a %.1f grados (maximo)\n", M1_ANG_MAX);
-        objetivo = M1_ANG_MAX;
-    }
-
-    printf("M1: pot actual %.2f -> objetivo %.2f\n", pot, objetivo);
-
-    for (int k = 0; k < M1_MAX_CORRECCIONES; k++) {
-        float actual = leer_pot_grados();
-        float error = objetivo - actual;
-
-        if (fabsf(error) <= M1_TOLERANCIA) break;
-
-        int32_t pasos = (int32_t)lroundf(error / GRADOS_POR_PASO);
-        if (pasos == 0) pasos = (error > 0) ? 1 : -1;
-        if (pasos > M1_SEG_MAX_PASOS) pasos = M1_SEG_MAX_PASOS;
-        if (pasos < -M1_SEG_MAX_PASOS) pasos = -M1_SEG_MAX_PASOS;
-
-        printf("M1: error %+.2f -> %ld pasos\n", error, (long)pasos);
-
-        resultado_mov_t r = mover_pasos(&M1, pasos);
-        if (r != MOV_OK) break;
-
-        vTaskDelay(pdMS_TO_TICKS(ESTABILIZACION_MS));
-    }
-
-    float final = leer_pot_grados();
-    printf("M1 final: pot %.2f (objetivo %.2f, error %+.2f)\n",
-           final, objetivo, objetivo - final);
+    double incremento_ajustado = incremento * 1.8;
+    int32_t pasos = (int32_t)llround(incremento_ajustado / GRADOS_POR_PASO);
+    printf("M1: %.2f x 1.8 = %.2f grados -> %ld pasos\n",
+           incremento, incremento_ajustado, (long)pasos);
+    mover_pasos(&M1, pasos);
+    printf("M1 posicion estimada: %.2f grados\n", M1.pos_pasos * GRADOS_POR_PASO);
 }
 
 // =====================================================================
@@ -479,15 +415,6 @@ void app_main(void)
     // UART consola
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_0, 256, 0, 0, NULL, 0));
 
-    // ADC potenciometro
-    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = POT_UNIDAD };
-    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &g_adc));
-    adc_oneshot_chan_cfg_t chan_cfg = {
-        .atten = ADC_ATTEN_DB_12,
-        .bitwidth = ADC_BITWIDTH_12,
-    };
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(g_adc, POT_CANAL, &chan_cfg));
-
     construir_tablas_rampa();
 
     // Un timer por motor
@@ -521,7 +448,7 @@ void app_main(void)
     xTaskCreate(tarea_motor1, "motor1", 4096, NULL, 5, &M1.tarea);
     xTaskCreate(tarea_motor2, "motor2", 4096, NULL, 5, &M2.tarea);
 
-    printf("\n=== Control brazo: M1 (pot) + M2 (relacion %.3f) + Servo ===\n", RELACION_M2);
+    printf("\n=== Control brazo: M1 + M2 (relacion %.3f) + Servo ===\n", RELACION_M2);
     printf("Resolucion: %.2f grados/paso\n\n", GRADOS_POR_PASO);
 
     while (1) {
